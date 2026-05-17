@@ -1,0 +1,8 @@
+/target/
+.docker/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+docker-compose.override.yml
