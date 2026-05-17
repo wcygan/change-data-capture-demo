@@ -67,8 +67,8 @@ async fn apply_event(search: &SearchClient, event: &DebeziumUpdateEvent) -> Resu
     info!(
         topic = %event.topic,
         key_id = event.key.id,
-        before_plan = %event.value.before.plan,
-        after_plan = %event.value.after.plan,
+        before_plan = event.before_plan().unwrap_or("<unavailable>"),
+        after_plan = event.after_plan().unwrap_or("<missing>"),
         "received CDC update event"
     );
 

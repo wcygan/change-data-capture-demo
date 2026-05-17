@@ -2,8 +2,8 @@
 
 ## Purpose
 
-This repository will become a small, runnable Rust demo that shows how Change
-Data Capture (CDC) keeps a derived read model in sync with source data.
+This repository is a small, runnable Rust demo that shows how Change Data
+Capture (CDC) keeps a derived read model in sync with source data.
 
 The intended audience is engineers who have heard terms like CDC, Debezium,
 Kafka, OpenSearch, stale reads, or read models, but have not seen the pieces
@@ -20,7 +20,7 @@ The demo should make one idea obvious:
 The demo follows one user row:
 
 ```sql
-UPDATE users
+UPDATE public.users
 SET plan = 'pro'
 WHERE id = 42;
 ```
@@ -35,7 +35,8 @@ Before downstream indexing completes, OpenSearch may still return:
 }
 ```
 
-After the CDC event is consumed by the Rust indexer, OpenSearch should return:
+After the Debezium event is consumed by the Rust indexer, OpenSearch should
+return:
 
 ```json
 {
@@ -45,33 +46,38 @@ After the CDC event is consumed by the Rust indexer, OpenSearch should return:
 }
 ```
 
-The user should be able to see the stale read, produce the change event, run the
+The user should be able to see the stale read, update the source row, run the
 indexer, and see the derived view catch up.
 
-## First Version
+## Pipeline
 
-The first version should be a CDC simulator, not a full Postgres + Debezium
-deployment.
+The local demo uses the real CDC components:
 
-That means:
+- Postgres stores the source `public.users` row.
+- Debezium runs as a Kafka Connect source connector.
+- Redpanda provides the Kafka-compatible broker.
+- OpenSearch stores the derived read model.
+- Rust binaries provide the operator CLI and indexer.
 
-- A Rust CLI produces Debezium-style change records to a Kafka-compatible topic.
-- Redpanda provides the local Kafka-compatible broker.
-- A Rust indexer consumes the topic and updates OpenSearch.
-- The same Rust CLI queries OpenSearch so the reader can observe stale and
-  current values.
-
-This keeps the project easy to run and easy to understand. Once the core demo is
-clear, a later phase can replace the simulated producer with real Postgres
-logical decoding through Debezium.
+The simulator path can still be useful for narrow event tests, but the main demo
+path should be the real Postgres -> Debezium -> Kafka -> Rust -> OpenSearch
+pipeline.
 
 ## Architecture
 
 ```text
 Rust CLI
-  seed/query/produce
+  bootstrap/seed/query/produce
         |
-        | produce Debezium-style event
+        | seed/update source row
+        v
+Postgres public.users
+        |
+        | logical decoding through pgoutput
+        v
+Debezium Postgres connector in Kafka Connect
+        |
+        | publish update event
         v
 Redpanda topic: app.public.users
         |
@@ -90,10 +96,12 @@ Rust CLI
 
 ## Local Developer Experience
 
-The final demo should have one obvious path:
+The demo has one obvious path:
 
 ```bash
 just up
+just bootstrap
+just reset
 just seed
 just query
 just produce-upgrade
@@ -104,17 +112,18 @@ just query
 
 Expected behavior:
 
-1. `just up` starts Redpanda and OpenSearch.
-2. `just seed` writes `users/_doc/42` to OpenSearch with `plan: free`.
-3. The first `just query` shows `plan: free`.
-4. `just produce-upgrade` writes a CDC event showing `free -> pro` to
-   `app.public.users`.
-5. The next `just query` can still show `plan: free`, demonstrating the stale
+1. `just up` starts Postgres, Redpanda, Kafka Connect, and OpenSearch.
+2. `just bootstrap` creates `public.users` and registers the Debezium connector.
+3. `just reset` clears source rows and the OpenSearch index.
+4. `just seed` writes `public.users` and `users/_doc/42` with `plan: free`.
+5. The first `just query` shows `plan: free`.
+6. `just produce-upgrade` updates Postgres from `free` to `pro`.
+7. The next `just query` can still show `plan: free`, demonstrating the stale
    derived read.
-6. `just index-once` consumes the event and updates OpenSearch.
-7. The final `just query` shows `plan: pro`.
+8. `just index-once` consumes the Debezium event and updates OpenSearch.
+9. The final `just query` shows `plan: pro`.
 
-The demo may also support a long-running indexer:
+The demo also supports a long-running indexer:
 
 ```bash
 cargo run --bin indexer -- run
@@ -128,20 +137,26 @@ That mode is useful after the reader understands the stale-read window.
 
 The `cdc` binary is the operator-facing CLI.
 
-Planned commands:
+Commands:
 
 ```text
+cdc bootstrap
 cdc seed --user-id 42 --name Ada --plan free
+cdc source-query --user-id 42
 cdc query --user-id 42
 cdc produce --user-id 42 --name Ada --from free --to pro
+cdc connector-status
+cdc delete-connector
 cdc reset
 ```
 
 Responsibilities:
 
-- Seed the OpenSearch read model with a known user document.
-- Query OpenSearch and print the current observed document.
-- Produce Debezium-style update events to Redpanda.
+- Create the source table and register the Debezium connector.
+- Seed Postgres and the OpenSearch read model with a known user document.
+- Query Postgres and OpenSearch so the reader can compare source and derived
+  state.
+- Update the source row so Debezium emits the CDC event.
 - Reset local demo state when useful.
 - Print concise, readable output for people following the demo manually.
 
@@ -149,7 +164,7 @@ Responsibilities:
 
 The `indexer` binary consumes CDC events and updates OpenSearch.
 
-Planned modes:
+Modes:
 
 ```text
 indexer run
@@ -159,13 +174,13 @@ indexer once
 Responsibilities:
 
 - Consume records from `app.public.users`.
-- Deserialize the event envelope.
-- Validate that the event targets the expected table.
+- Decode Kafka key/value JSON produced by the Debezium Postgres connector.
+- Validate that the event targets `public.users` and is an update.
 - Apply `value.after` to OpenSearch document `users/_doc/{id}`.
 - Commit the Kafka offset only after the OpenSearch update succeeds.
 - Log each step clearly enough that readers can follow the data movement.
 
-## Suggested Repo Shape
+## Repo Shape
 
 ```text
 Cargo.toml
@@ -178,79 +193,97 @@ src/
   bin/
     cdc.rs
     indexer.rs
+  cli.rs
   config.rs
+  connect.rs
   event.rs
   kafka.rs
   search.rs
+  source.rs
+
+tests/
+  stale_read_flow.rs
 ```
 
 Module responsibilities:
 
 - `config.rs`: environment variables, default URLs, topic names, and index names.
-- `event.rs`: Debezium-style event structs and helper constructors.
-- `kafka.rs`: producer and consumer setup.
+- `connect.rs`: Kafka Connect REST calls for Debezium connector registration and
+  readiness.
+- `event.rs`: Debezium-style event structs, Kafka key/value decoding, and event
+  validation.
+- `kafka.rs`: Redpanda/Kafka consumer setup and offset commits.
 - `search.rs`: OpenSearch document setup, writes, queries, and reset helpers.
+- `source.rs`: Postgres source table setup, writes, queries, and reset helpers.
 
 Keep the implementation linear and explicit. This project is a teaching tool,
 so readable control flow matters more than abstraction density.
 
 ## Event Contract
 
-The produced message should intentionally resemble a Debezium update event:
+Debezium publishes the Kafka key and value separately. With the JSON converter
+and schemas disabled, the relevant update event looks like:
 
 ```json
+// Kafka key
 {
-  "topic": "app.public.users",
-  "key": {
-    "id": 42
-  },
-  "value": {
-    "before": {
-      "id": 42,
-      "name": "Ada",
-      "plan": "free"
-    },
-    "after": {
-      "id": 42,
-      "name": "Ada",
-      "plan": "pro"
-    },
-    "source": {
-      "schema": "public",
-      "table": "users",
-      "lsn": 24023128
-    },
-    "op": "u"
-  }
+  "id": 42
 }
 ```
 
-The exact JSON can be simpler than real Debezium output, but it should preserve
-the important teaching fields:
+```json
+// Kafka value
+{
+  "before": {
+    "id": 42,
+    "name": "Ada",
+    "plan": "free"
+  },
+  "after": {
+    "id": 42,
+    "name": "Ada",
+    "plan": "pro"
+  },
+  "source": {
+    "schema": "public",
+    "table": "users",
+    "lsn": 24023128
+  },
+  "op": "u"
+}
+```
 
-- `key.id`: the primary key.
-- `value.before`: the previous source row.
-- `value.after`: the committed source row.
-- `value.source.schema`: the source schema.
-- `value.source.table`: the source table.
-- `value.source.lsn`: a source ordering marker.
-- `value.op`: the operation type, with `u` meaning update.
+The exact JSON contains additional Debezium metadata, but the indexer should
+preserve these important teaching fields:
+
+- Kafka key `id`: the primary key.
+- `before`: the previous source row when available.
+- `after`: the committed source row.
+- `source.schema`: the source schema.
+- `source.table`: the source table.
+- `source.lsn`: a source ordering marker.
+- `op`: the operation type, with `u` meaning update.
+
+The source table uses `REPLICA IDENTITY FULL` so update events include enough
+`before` data for the stale-read story. The indexer still treats `before` as
+optional at the Rust boundary because real Debezium deployments can emit partial
+`before` rows.
 
 ## OpenSearch Contract
 
-The demo should use one index:
+The demo uses one index:
 
 ```text
 users
 ```
 
-The document ID should match the user ID:
+The document ID matches the user ID:
 
 ```text
 users/_doc/42
 ```
 
-The stored document should be intentionally small:
+The stored document is intentionally small:
 
 ```json
 {
@@ -259,70 +292,3 @@ The stored document should be intentionally small:
   "plan": "pro"
 }
 ```
-
-This keeps the demo focused on CDC mechanics rather than search schema design.
-
-## Dependencies
-
-Likely Rust dependencies:
-
-- `tokio` for async runtime.
-- `clap` for CLI parsing.
-- `serde` and `serde_json` for event/document serialization.
-- `rdkafka` for Kafka-compatible producer and consumer access.
-- `opensearch` for OpenSearch access.
-- `anyhow` for application-level error context.
-- `tracing` and `tracing-subscriber` for readable logs.
-
-The final dependency set should be selected during implementation, but the
-project should stay small and conventional.
-
-## Non-Goals
-
-The first version will not:
-
-- Run real Postgres logical decoding.
-- Run Debezium Connect.
-- Model every Debezium envelope field.
-- Teach Kafka partitioning, compaction, schema registries, or exactly-once
-  processing.
-- Build a production-ready indexing service.
-
-Those topics are valuable, but they would make the first teaching loop harder
-to run and harder to read.
-
-## Later Phases
-
-After the simulator works, possible next steps are:
-
-1. Add a real Postgres container.
-2. Add Debezium and Kafka Connect.
-3. Replace `cdc produce` with an actual SQL update against Postgres.
-4. Keep the same Rust indexer and OpenSearch query path.
-5. Add a small walkthrough page or terminal transcript that maps each command to
-   the CDC concept it demonstrates.
-
-The important constraint is that each phase should preserve the same core story:
-source write, stale derived read, durable change event, indexer catch-up,
-correct derived read.
-
-## Verification Goals
-
-The project is done when a new reader can run a short command sequence and
-observe:
-
-1. OpenSearch starts with `plan: free`.
-2. A CDC update event is produced with `before.plan: free` and `after.plan: pro`.
-3. OpenSearch still reads `plan: free` before the indexer processes the event.
-4. The Rust indexer consumes the event and updates the OpenSearch document.
-5. OpenSearch reads `plan: pro` after indexing.
-
-Implementation should include focused tests for:
-
-- Event JSON serialization and deserialization.
-- Mapping `value.after` into an OpenSearch document.
-- Ignoring or rejecting events for unexpected tables.
-- CLI argument parsing for the main demo commands.
-
-End-to-end validation should be available through `just` once Docker services
-are part of the repo.

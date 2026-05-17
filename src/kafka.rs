@@ -4,6 +4,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use rdkafka::ClientConfig;
 use rdkafka::Message;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
+use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::message::BorrowedMessage;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::util::Timeout;
@@ -20,7 +21,8 @@ pub async fn produce_event(config: &DemoConfig, event: &DebeziumUpdateEvent) -> 
         .context("failed to create Kafka producer")?;
 
     let key = serde_json::to_string(&event.key).context("failed to encode Kafka key")?;
-    let payload = serde_json::to_string(event).context("failed to encode CDC event payload")?;
+    let payload =
+        serde_json::to_string(&event.value).context("failed to encode CDC event value")?;
 
     producer
         .send(
@@ -56,25 +58,27 @@ impl CdcConsumer {
     }
 
     pub async fn next_event(&self) -> Result<(BorrowedMessage<'_>, DebeziumUpdateEvent)> {
-        let message = self
-            .consumer
-            .recv()
-            .await
-            .context("failed to receive Kafka message")?;
+        loop {
+            let message = match self.consumer.recv().await {
+                Ok(message) => message,
+                Err(error) if should_retry_consume_error(&error) => {
+                    time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+                Err(error) => return Err(error).context("failed to receive Kafka message"),
+            };
 
-        decode_message(message)
+            return decode_message(message);
+        }
     }
 
     pub async fn next_event_with_timeout(
         &self,
         duration: Duration,
     ) -> Result<(BorrowedMessage<'_>, DebeziumUpdateEvent)> {
-        let message = time::timeout(duration, self.consumer.recv())
+        time::timeout(duration, self.next_event())
             .await
             .with_context(|| format!("timed out after {duration:?} waiting for a CDC event"))?
-            .context("failed to receive Kafka message")?;
-
-        decode_message(message)
     }
 
     pub fn commit(&self, message: &BorrowedMessage<'_>) -> Result<()> {
@@ -84,16 +88,30 @@ impl CdcConsumer {
     }
 }
 
+fn should_retry_consume_error(error: &KafkaError) -> bool {
+    matches!(
+        error,
+        KafkaError::MessageConsumption(RDKafkaErrorCode::UnknownTopicOrPartition)
+    )
+}
+
 fn decode_message(
     message: BorrowedMessage<'_>,
 ) -> Result<(BorrowedMessage<'_>, DebeziumUpdateEvent)> {
+    let key = match message.key_view::<str>() {
+        None => None,
+        Some(Ok(key)) => Some(key),
+        Some(Err(error)) => bail!("Kafka message key was not UTF-8: {error}"),
+    };
+
     let payload = match message.payload_view::<str>() {
         None => bail!("Kafka message did not include a payload"),
         Some(Ok(payload)) => payload,
         Some(Err(error)) => bail!("Kafka message payload was not UTF-8: {error}"),
     };
 
-    let event = serde_json::from_str(payload).context("failed to decode CDC event payload")?;
+    let event = DebeziumUpdateEvent::from_kafka_json(message.topic(), key, Some(payload))
+        .context("failed to decode CDC event payload")?;
 
     Ok((message, event))
 }

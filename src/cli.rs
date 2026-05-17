@@ -10,7 +10,7 @@ pub struct CdcArgs {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum CdcCommand {
-    /// Seed the OpenSearch read model with a known user document.
+    /// Seed Postgres and the OpenSearch read model with a known user document.
     Seed {
         #[arg(long, default_value_t = 42)]
         user_id: i64,
@@ -26,7 +26,7 @@ pub enum CdcCommand {
         user_id: i64,
     },
 
-    /// Produce a Debezium-style user plan update event.
+    /// Update the source user row; Debezium will publish the CDC event.
     Produce {
         #[arg(long, default_value_t = 42)]
         user_id: i64,
@@ -38,8 +38,23 @@ pub enum CdcCommand {
         to: String,
     },
 
-    /// Delete the OpenSearch read model index.
+    /// Delete source rows and the OpenSearch read model index.
     Reset,
+
+    /// Create the source table and register the Debezium Postgres connector.
+    Bootstrap,
+
+    /// Print the current Debezium connector status.
+    ConnectorStatus,
+
+    /// Delete the Debezium connector.
+    DeleteConnector,
+
+    /// Query the current Postgres source row for a user.
+    SourceQuery {
+        #[arg(long, default_value_t = 42)]
+        user_id: i64,
+    },
 }
 
 #[derive(Debug, Parser, PartialEq, Eq)]
@@ -122,6 +137,22 @@ mod tests {
                 to: "pro".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn parses_bootstrap_command() {
+        let args =
+            CdcArgs::try_parse_from(["cdc", "bootstrap"]).expect("bootstrap command should parse");
+
+        assert_eq!(args.command, CdcCommand::Bootstrap);
+    }
+
+    #[test]
+    fn parses_source_query_command() {
+        let args = CdcArgs::try_parse_from(["cdc", "source-query", "--user-id", "42"])
+            .expect("source-query command should parse");
+
+        assert_eq!(args.command, CdcCommand::SourceQuery { user_id: 42 });
     }
 
     #[test]
